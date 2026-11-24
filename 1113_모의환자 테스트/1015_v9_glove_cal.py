@@ -118,9 +118,9 @@ I_MAX   = 4.12            # A; AO ±10 V current scaling; confirm ESCON and moto
 T_MAX   = I_MAX * KT / SPOOL_R
 SLACK_SAT = 4.5           # N  슬랙 루프 힘 상한
 TGT_RATE  = 700.0         # deg/s 목표 이동 속도 상한
-SPIKE_VEL      = 7000.0   # deg/s
-CABLE_LIMIT_MM = 2000.0
-DTH_LIMIT      = 2000.0    # deg  Δθ 이상 판정
+SPIKE_VEL      = 5000.0   # deg/s
+CABLE_LIMIT_MM = 1000.0
+DTH_LIMIT      = 1000.0    # deg  Δθ 이상 판정
 
 # ── 제어 기본값 (UI 실시간 변경) ──
 DEFAULT_PARAMS = dict(
@@ -288,10 +288,18 @@ MAP_BLEND_TIME = 0.30          # s
 FINGER_IDS   = ("I", "M", "T")                       # 검지, 중지, 약지
 FINGER_NAMES = {"I": "검지", "M": "중지", "T": "엄지"}
 
+# ── 캘리브레이션 그룹 (동시에 sweep 할 손가락 묶음) ──
+CAL_GROUPS = {
+    "엄지": ("T",),
+    "검지·중지": ("I", "M"),
+    "전체": ("I", "M", "T"),
+}
+CAL_GROUP_DEFAULT = "엄지"
+
 # ★★★ 배선된 손가락만 여기에. 내일 검지만 테스트면 이대로. ★★★
 ENABLED_FINGERS = {
-    "G1": ["I"],          # 예: ["I", "M", "T"]
-    "G2": ["I"],
+    "G1": ["I", "M", "T"],          # 예: ["I", "M", "T"]
+    "G2": ["I", "M", "T"],
 }
 
 # ── 모터 정의 ──
@@ -2115,19 +2123,10 @@ class Coupling:
 # ═══════════════════════════════════════════════════════ 제어 스레드
 
 class GloveSweepCal:
-    """Run finger sweeps in phases and save one glove bundle.
-
-    엄지와 검지가 동시에 굽혀지면 서로 부딪혀 끝까지 굽혀지지 않으므로
-    SWEEP_PHASES 순서대로 진행한다: 엄지 단독 → 검지+중지 동시.
-    """
-    SWEEP_PHASES = (("T",), ("I", "M"))
-
+    """Run independent finger sweeps concurrently and save one glove bundle."""
     def __init__(self):
-        self.children = []        # 현재 phase 에서 진행 중인 SweepCal
-        self.completed = []       # 이미 끝난 phase 의 SweepCal
+        self.children = []
         self.fingers = []
-        self.phases = []
-        self.phase_idx = 0
         self.state = "off"
         self.msg = ""
         self.cycle = 0
@@ -2142,38 +2141,16 @@ class GloveSweepCal:
 
     def begin(self, fingers):
         self.fingers = list(fingers)
-        by_fid = {f.fid: f for f in self.fingers}
-        self.phases = []
-        used = set()
-        for group in self.SWEEP_PHASES:
-            ph = [by_fid[fid] for fid in group if fid in by_fid]
-            used.update(f.fid for f in ph)
-            if ph:
-                self.phases.append(ph)
-        rest = [f for f in self.fingers if f.fid not in used]
-        if rest:
-            self.phases.append(rest)
         self.children = []
-        self.completed = []
         self.state = "running"
         self.cycle = 0
         for f in self.fingers:
             f.map_aligned = False
-        self._start_phase(0)
-
-    def _phase_label(self):
-        names = "+".join(f.fname for f in self.phases[self.phase_idx])
-        return f"[{self.phase_idx + 1}/{len(self.phases)} {names}]"
-
-    def _start_phase(self, idx):
-        self.phase_idx = idx
-        self.children = []
-        for f in self.phases[idx]:
             child = SweepCal()
             child.autosave = False
             child.begin(f)
             self.children.append(child)
-        self.msg = f"{self._phase_label()} sweep 시작"
+        self.msg = "Glove sweep started"
 
     def abort(self, msg="Stopped"):
         for child in self.children:
@@ -2188,11 +2165,6 @@ class GloveSweepCal:
                 f.set_manual(0., 0.)
             return
         try:
-            active = set(c.finger for c in self.children)
-            # 현재 phase 가 아닌 손가락은 장력 0 (대기/완료)
-            for f in self.fingers:
-                if f not in active:
-                    f.set_manual(0., 0.)
             for child in self.children:
                 if child.state != "done":
                     child.step(dt, params)
@@ -2202,15 +2174,8 @@ class GloveSweepCal:
                     self.abort(f"{child.finger.name}: {child.msg}")
                     return
             self.cycle = min(c.cycle for c in self.children)
-            self.msg = self._phase_label() + " " + " | ".join(
-                f"{c.finger.fid}: {c.msg if c.state != 'done' else 'Done'}" for c in self.children)
+            self.msg = " | ".join(f"{c.finger.fid}: {c.msg if c.state != 'done' else 'Done'}" for c in self.children)
             if all(c.state == "done" for c in self.children):
-                self.completed.extend(self.children)
-                for c in self.children:
-                    c.finger.set_manual(0., 0.)
-                if self.phase_idx + 1 < len(self.phases):
-                    self._start_phase(self.phase_idx + 1)
-                    return
                 self._save()
                 self.state = "done"
                 for f in self.fingers:
@@ -2220,21 +2185,33 @@ class GloveSweepCal:
 
     def _save(self):
         glove = self.fingers[0].glove_short
+        os.makedirs(MAP_DIR, exist_ok=True)
+        path = os.path.join(MAP_DIR, f"{glove}.json")
+        old_fingers = {}
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fp:
+                    old = json.load(fp)
+                if old.get("format") == "glove_tendon_maps_v1" and old.get("glove") == glove:
+                    old_fingers = dict(old.get("fingers", {}))
+            except Exception:
+                old_fingers = {}
         payload = {"format": "glove_tendon_maps_v1", "glove": glove,
-                   "date": time.strftime("%Y-%m-%d %H:%M:%S"), "fingers": {}}
+                   "date": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "fingers": old_fingers}   # 다른 그룹 지도는 유지, 이번 그룹만 덮어씀
         for f in self.fingers:
             m = f.map
             payload["fingers"][f.fid] = dict(
                 name=f.key, map_type="direction_separated",
                 raw_flexion=m.raw_flexion, raw_extension=m.raw_extension,
-                raw=m.raw, meta=m.meta)
-        os.makedirs(MAP_DIR, exist_ok=True)
-        path = os.path.join(MAP_DIR, f"{glove}.json")
+                raw=m.raw, meta=m.meta,
+                date=time.strftime("%Y-%m-%d %H:%M:%S"))
         temporary = path + ".tmp"
         with open(temporary, "w", encoding="utf-8") as fp:
             json.dump(payload, fp, ensure_ascii=False, indent=2)
         os.replace(temporary, path)
-        self.msg = f"{glove}: all fingers complete -> {path}"
+        done = "+".join(f.fid for f in self.fingers)
+        self.msg = f"{glove} [{done}] complete -> {path}"
 
 
 class ControlThread(threading.Thread):
@@ -2392,14 +2369,15 @@ class ControlThread(threading.Thread):
             self.bank.flush()
             return None
 
-    def start_sweep(self, finger):
+    def start_sweep(self, finger, fids=None):
         with self.lock:
             if self.estop:
                 return
             self.stop_all()
             self.cal_finger = finger
             glove = next(g for g in self.gloves if g.short == finger.glove_short)
-            fingers = list(glove.fingers.values())
+            fingers = [f for fid, f in glove.fingers.items()
+                       if fids is None or fid in fids]
             if not fingers or any(f.single for f in fingers):
                 return
             self.sweep.begin(fingers)
@@ -3115,11 +3093,21 @@ class App:
                 items.append((f"{g.short}-{FINGER_NAMES[fid]}", f))
         return items
 
-    def _sel_finger(self):
+    def _sel_cal_fids(self):
+        var = getattr(self, "cal_group_var", None)
+        return CAL_GROUPS.get(var.get() if var else CAL_GROUP_DEFAULT,
+                              CAL_GROUPS[CAL_GROUP_DEFAULT])
+
+    def _sel_cal_units(self):
+        fids = self._sel_cal_fids()
         for g in self.ctl.gloves:
             if g.short == self.cal_var.get():
-                return next(iter(g.fingers.values()), None)
-        return None
+                return [f for fid, f in g.fingers.items() if fid in fids]
+        return []
+
+    def _sel_finger(self):
+        units = self._sel_cal_units()
+        return units[0] if units else None
 
     def _build(self):
         pad = dict(padx=8, pady=4)
@@ -3216,6 +3204,13 @@ class App:
                           values=labels, width=13, state="readonly")
         cb.grid(row=0, column=1, sticky="w", **pad)
         cb.bind("<<ComboboxSelected>>", lambda e: self._pick_cal_finger())
+
+        ttk.Label(setup, text="대상 손가락").grid(row=1, column=0, sticky="e", **pad)
+        self.cal_group_var = tk.StringVar(value=CAL_GROUP_DEFAULT)
+        cbg = ttk.Combobox(setup, textvariable=self.cal_group_var,
+                           values=list(CAL_GROUPS), width=13, state="readonly")
+        cbg.grid(row=1, column=1, sticky="w", **pad)
+        cbg.bind("<<ComboboxSelected>>", lambda e: self._pick_cal_finger())
 
         cal_items = [
             ("T_CAL_F", "Flex 장력 [N]"),
@@ -3431,19 +3426,21 @@ class App:
         self.lbl_map_sum.config(text=f.map.summary())
 
     def _start_sweep(self):
-        f = self._sel_finger()
-        if f is None:
+        units = self._sel_cal_units()
+        if not units:
+            messagebox.showwarning("Sweep", "선택한 장갑에 해당 손가락이 활성화되어 있지 않습니다 (ENABLED_FINGERS 확인)")
             return
-        glove = next(g for g in self.ctl.gloves if g.short == f.glove_short)
-        if any(unit.single for unit in glove.fingers.values()):
-            messagebox.showwarning("Sweep", f"{f.name}: 엔코더 2개가 모두 필요합니다")
+        f = units[0]
+        bad = [u.name for u in units if u.single]
+        if bad:
+            messagebox.showwarning("Sweep", f"{', '.join(bad)}: 엔코더 2개가 모두 필요합니다")
             return
         if self.ctl.estop:
             messagebox.showwarning("Sweep", "비상정지 상태입니다")
             return
         if not self._apply_all_cal_params():
             return
-        self.ctl.start_sweep(f)
+        self.ctl.start_sweep(f, tuple(u.fid for u in units))
         self._sync_enable_widgets_off()
 
     def _stop_sweep(self):
@@ -3469,11 +3466,16 @@ class App:
                     raise ValueError("Glove mismatch (G1/G2)")
                 glove = next(g for g in self.ctl.gloves if g.short == f.glove_short)
                 candidates = {}
+                saved = payload.get("fingers", {})
                 for fid, unit in glove.fingers.items():
+                    if fid not in saved:
+                        continue          # 그룹별 캘리브레이션: 아직 안 한 손가락은 건너뜀
                     candidate = TendonMap()
-                    if not candidate.load_data(payload["fingers"][fid], unit.key):
+                    if not candidate.load_data(saved[fid], unit.key):
                         raise ValueError(f"{fid}: invalid map")
                     candidates[fid] = candidate
+                if not candidates:
+                    raise ValueError("이 파일에 활성 손가락 지도가 없습니다.")
                 with self.ctl.lock:
                     for fid, candidate in candidates.items():
                         glove.fingers[fid].map = candidate

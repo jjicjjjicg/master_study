@@ -1,0 +1,24 @@
+{
+  "cameras": {
+    "top": "",
+    "side_G1": "",
+    "side_G2": ""
+  },
+  "views": [
+    {"name": "top_G1",  "camera": "top",     "hand": "G1", "roi": [0, 0, 320, 480]},
+    {"name": "top_G2",  "camera": "top",     "hand": "G2", "roi": [320, 0, 640, 480]},
+    {"name": "side_G1", "camera": "side_G1", "hand": "G1", "roi": null},
+    {"name": "side_G2", "camera": "side_G2", "hand": "G2", "roi": null}
+  ],
+  "colors": {"G1": "marker_colors.json", "G2": "marker_colors.json"},
+  "bones":  {"G1": "marker_bones.json",  "G2": "marker_bones.json"},
+  "width": 640, "height": 480, "fps": 30,
+  "max_jump_mm": 60.0,
+  "bone_tol": 0.25,
+  "smooth": 3,
+  "min_blob_area": 12,
+  "fuse_max_diff_deg": 25.0,
+  "reject_reset_frames": 15,
+  "preview": true,
+  "preview_scale": 0.6
+}

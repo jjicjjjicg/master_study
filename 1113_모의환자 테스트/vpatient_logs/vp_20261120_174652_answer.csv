@@ -1,7 +1,0 @@
-﻿# 경직 정답지,profile,정상,scenario,물체 잡고 옮기기,grade_I=2
-event,kind,finger,grade,trial,state,bidirectional,t_onset_s,t_end_s,duration_s,curl_onset,ext_vel_onset_cps,thr_curl,peak_N,n_bursts,detected,t_mark_s,reaction_s
-
-# 오경보 (경직이 없는데 표시함),t_mark_s,finger
-
-# 요약,finger,grade,spasms,detected,false_alarms,mean_reaction_s,catch_only,catch_detected
-summary,검지,2,0,0,0,,0,0

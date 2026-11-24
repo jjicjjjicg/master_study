@@ -1,1 +1,11 @@
-__pycache__/ 
+# Recorded videos
+*.mp4
+*.avi
+*.mov
+
+# Camera recordings
+recordings/
+
+# Python cache
+__pycache__/
+*.pyc
