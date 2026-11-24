@@ -1,0 +1,28 @@
+{
+  "model": "session3_plus_session1_20261027_235755_f16724",
+  "source": "outputs\\pose\\session3_plus_session1_20261027_235755_f16724\\training\\weights\\best.pt",
+  "sha256": "38f1197d11a25ff012d022fca8c3645c06aedaf3e10dc8501f5442b8bba0da7c",
+  "keypoints": [
+    "M01",
+    "M02",
+    "M03",
+    "M04",
+    "M05",
+    "M06",
+    "M07",
+    "M08",
+    "M09",
+    "M10",
+    "M11",
+    "M12"
+  ],
+  "training_environment": {
+    "ultralytics": "8.4.182",
+    "torch": "2.10.0",
+    "torchvision": "0.25.0",
+    "numpy": "2.4.6",
+    "opencv-python": "5.0.0.93",
+    "pyrealsense2": "2.59.1.11053"
+  },
+  "purpose": "2D per-camera pose preview. No 3D/angles or cross-camera temporal synchronization."
+}

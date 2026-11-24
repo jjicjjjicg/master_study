@@ -1,0 +1,2 @@
+﻿trial,result,fail_at,t_open_s,t_grasp_s,t_transport_s,t_total_s,slips,limit_s,bidirectional,mode_changed,profile
+1,success,,0.009,7.738,14.821,15.435,1,20.0,1,0,정상
