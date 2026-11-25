@@ -9,7 +9,7 @@ marker_track_3d.py — 카메라 여러 대에서 동시에 마커를 잡아, �
   3D 뷰에서는 보기 편하게 위쪽 = -Y 로 그린다 (CSV 에는 원래 카메라 좌표 그대로 저장).
 
 실행:
-    conda activate realsense
+    conda activate rs_env
     python marker_track_3d.py
     python marker_track_3d.py --res 1280x720      # 튜닝한 해상도와 같게
     python marker_track_3d.py --no-save           # CSV 저장 안 함
@@ -40,7 +40,7 @@ from pathlib import Path
 
 import numpy as np
 
-from marker_common import (HERE, RSCamera, cv2, detect, list_devices, load_hsv, put, range_bgr)
+from marker_common import (HERE, RSCamera, cv2, detect, list_devices, load_hsv, make_masks, put, range_bgr)
 
 BAR_H = 30
 MATCH_PX = 80          # 프레임 간 같은 마커로 볼 최대 픽셀 이동
@@ -247,6 +247,7 @@ def main():
     ap.add_argument("--win-h", type=int, default=950, help="처음 창 높이")
     ap.add_argument("--duration", type=float, default=0, help="N초 후 자동 종료(테스트용)")
     ap.add_argument("--record", action="store_true", help="시작하자마자 화면 녹화")
+    ap.add_argument("--max-depth", type=float, default=800, help="이보다 먼(mm) 또는 depth 없는 blob 무시. 0 = 끔")
     args = ap.parse_args()
     W, H = map(int, args.res.lower().split("x"))
 
@@ -264,8 +265,10 @@ def main():
 
         def processor(cam, item, c=conf[s]):
             out = []
+            masks = make_masks(item["hsv"], c["hsv"])     # 겹치는 색은 가장 가까운 색 하나에만 (튜너와 동일)
             for name, rng in c["hsv"].items():
-                dets, _ = detect(cam, item, rng, int(rng.get("count", 1)))
+                dets, _ = detect(cam, item, rng, int(rng.get("count", 1)), mask=masks[name],
+                                 max_depth=args.max_depth)
                 for d in c["ids"][name].assign(dets, item["t"]):
                     d["name"] = name
                     out.append(d)

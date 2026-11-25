@@ -5,12 +5,14 @@ marker_hsv_tune.py — 카메라 여러 대를 동시에 띄워서, 카메라마
 카메라별로 따로 저장한다:  hsv_<serial>.json  (이 폴더)
 
 사용:
-    conda activate realsense
+    conda activate rs_env
     python marker_hsv_tune.py                                   # 연결된 RealSense 전부
     python marker_hsv_tune.py --markers wrist:1 thumb:3 index:4 middle:4
     python marker_hsv_tune.py --res 1280x720                    # 10mm 마커가 작게 보이면
+    python marker_hsv_tune.py --max-depth 800                   # 이보다 먼 blob 무시 (mm, 기본 800)
 
 순서:
+    0) L 로 노출/화이트밸런스 고정 (자동이면 손을 움직일 때마다 색이 바뀜). 반드시 샘플 클릭 '전에'.
     1) 숫자키로 마커 이름(색) 선택
     2) 각 카메라 화면에서 그 색 마커를 클릭 → 클릭 지점과 비슷한 색 영역을 샘플로 추가
        (여러 개 / 여러 각도에서 몇 번 클릭할수록 조명 변화에 강해짐)
@@ -27,18 +29,24 @@ marker_hsv_tune.py — 카메라 여러 대를 동시에 띄워서, 카메라마
                - 샘플 성공하면 초록 테두리가 잠깐 뜨고 위 막대에 'OK ... +N px' 표시
     U       : 마지막 클릭 취소
     R       : 선택 마커 샘플 초기화 (모든 카메라)
-    M       : 마스크 보기 on/off
-    S       : 저장
+    M       : 마스크 보기 on/off   (흰색 = 채택된 마커, 회색 = 색은 맞지만 너무 멀거나 depth 없음)
+    L       : 노출/게인/화이트밸런스 고정 <-> 자동 (마우스가 올라간 카메라만, 화면 밖이면 전부)
+    , / .   : 노출 줄이기 / 늘리기 (고정 상태에서. 마우스 올린 카메라만, 화면 밖이면 전부)
+    - / =   : 선택 마커의 색 거리 허용치(gate) 줄이기 / 늘리기
+              줄이면 배경/다른 색이 덜 잡히고, 너무 줄이면 마커도 일부 빠짐
+    F       : 전체화면 on/off (창 크기를 바꿔도 카메라 비율 유지, 남는 곳은 검은 여백)
+    S       : 저장 (hsv_<serial>.json + 카메라 설정 cam_<serial>.json -> 트래킹 때 같은 설정으로 열림)
     Q / ESC : 종료 (저장 안 한 변경이 있으면 한 번 더 눌러야 종료)
 """
 
 import argparse
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from marker_common import (DEFAULT_MARKERS, HERE, MIN_AREA, FONT, RSCamera, cv2, detect, list_devices,
-                           load_hsv, make_mask, parse_markers, put, range_bgr, ranges_from,
+from marker_common import (DEFAULT_MARKERS, HERE, MAHA_GATE, FONT, RSCamera, core_pixels, cv2, detect_all, list_devices,
+                           load_hsv, make_masks, parse_markers, put, range_bgr, ranges_from,
                            save_hsv)
 
 BAR_H = 64
@@ -104,6 +112,7 @@ def main():
     ap.add_argument("--res", default="640x480")
     ap.add_argument("--hsv-dir", default=str(HERE), help="hsv_<serial>.json 저장 폴더")
     ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--max-depth", type=float, default=800, help="이보다 먼(mm) 또는 depth 없는 blob 무시. 0 = 끔")
     args = ap.parse_args()
     W, H = map(int, args.res.lower().split("x"))
 
@@ -141,16 +150,34 @@ def main():
     ranges = {c.serial: {n: old[c.serial].get(n) for n, _ in markers} for c in cams}
     history = []           # (serial, name, 추가된 샘플 수)
     clicks = {c.serial: {n: 0 for n, _ in markers} for c in cams}
+    gates = {n: next((float(old[c.serial][n]["gate"]) for c in cams
+                      if "gate" in old[c.serial].get(n, {})), MAHA_GATE) for n, _ in markers}
     state = dict(sel=0, mask=False, dirty=False, quit_armed=False, frozen=False,
                  msg="", msg_col=(255, 255, 255), msg_t=0.0, mouse=None, flash=None)
     items = {}
+
+    cam_st = {c.serial: c.color_settings() for c in cams}   # 화면 표시용 캐시 (매 프레임 조회하면 느림)
+    for c in cams:
+        print(f"  {c.label}: " + ("AUTO 노출" if cam_st[c.serial]["auto"] else "LOCK (cam_*.json 적용)"))
+
+    def on_locked(cam, ok, msg):
+        cam_st[cam.serial] = cam.color_settings()
+        state["dirty"] = True
+        say(msg, None, (80, 220, 80) if ok else (60, 60, 255))
+
+    def target_cams():
+        mo = state["mouse"]
+        return [cams[mo[0]]] if mo else list(cams)
 
     def say(msg_en, msg_ko=None, col=(255, 255, 255)):
         print(msg_ko or msg_en)
         state["msg"], state["msg_col"], state["msg_t"] = msg_en, col, time.time()
 
     def on_mouse(ev, x, y, *_):
-        if y < BAR_H or x // W >= len(cams):
+        # 화면(레터박스 포함) 좌표 → 원본 UI 좌표
+        sc, ox, oy = view
+        x, y = int((x - ox) / sc), int((y - oy) / sc)
+        if y < BAR_H or y >= BAR_H + H or x < 0 or x // W >= len(cams):
             state["mouse"] = None
             return
         ci, tx, ty = x // W, x % W, y - BAR_H
@@ -168,26 +195,33 @@ def main():
                 f"{cam.model}: 클릭 근처에서 마커를 못 찾음 — 다시 클릭 (SPACE 로 화면 정지하면 쉬움)", (60, 60, 255))
             return
         x0, y0 = off
-        px = it["hsv"][y0:y0 + reg.shape[0], x0:x0 + reg.shape[1]][reg].tolist()
+        px_all = it["hsv"][y0:y0 + reg.shape[0], x0:x0 + reg.shape[1]][reg]
+        px = core_pixels(px_all).tolist()           # 테두리/그림자/검은색 빼고 마커 몸통만
+        if cam_st[cam.serial]["auto"]:
+            say(f"{cam.model}: AUTO exposure - press L first! (colors drift)",
+                f"{cam.model}: 자동 노출 상태 - 먼저 L 로 고정하세요 (색이 계속 바뀜)", (0, 140, 255))
         samples[cam.serial][name].extend(px)
         ranges[cam.serial][name] = ranges_from(samples[cam.serial][name])
         clicks[cam.serial][name] += 1
         history.append((cam.serial, name, len(px)))
         state["dirty"] = True
         state["flash"] = (ci, region_contours(reg, off), time.time())
-        say(f"OK  {cam.model} / {name}: +{len(px)}px  (total {len(samples[cam.serial][name])}px, "
+        say(f"OK  {cam.model} / {name}: +{len(px)}/{len(px_all)}px core  (total {len(samples[cam.serial][name])}px, "
             f"{clicks[cam.serial][name]} clicks)",
             f"{cam.model} / {name}: +{len(px)}px (총 {len(samples[cam.serial][name])}px, {clicks[cam.serial][name]}번째 클릭)",
             (80, 220, 80))
 
     win = "marker HSV tune"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    # 비율은 직접 레터박스로 맞춘다 (WINDOW_KEEPRATIO 는 Windows 최대화/전체화면에서 늘어나 버림)
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO)
+    view = [1.0, 0, 0]     # (scale, offset_x, offset_y): 원본 UI → 창 화면
     total_w = W * len(cams)
     if total_w > 1800:
         cv2.resizeWindow(win, 1800, int((H + BAR_H) * 1800 / total_w))
     cv2.setMouseCallback(win, on_mouse)
     print(__doc__.split("키:")[1])
 
+    pool = ThreadPoolExecutor(max_workers=len(cams))   # 카메라별 검출을 동시에 (numpy/OpenCV 는 GIL 을 풀어줌)
     try:
         while True:
             if not state["frozen"]:            # SPACE: 화면 정지 → 떨림 없이 클릭
@@ -198,27 +232,40 @@ def main():
             sel_name, sel_count = markers[state["sel"]]
 
             tiles = []
+            def analyze(c):
+                """카메라 한 대: 색 마스크(겹치는 색 정리) + 거리 안 blob. 3대를 스레드로 동시에."""
+                it = items.get(c.serial)
+                if it is None:
+                    return None
+                rngs = {n: dict(r, gate=gates[n]) for n, r in ranges[c.serial].items() if r}
+                masks = make_masks(it["hsv"], rngs)      # 겹치는 색은 가장 가까운 색 하나에만
+                cnt = dict(markers)
+                return {n: detect_all(c, it, r, mask=masks[n], max_depth=args.max_depth, refine=cnt.get(n, 1) + 2)
+                        for n, r in rngs.items()}
+
+            analyses = list(pool.map(analyze, cams))
             for ci, c in enumerate(cams):
                 it = items.get(c.serial)
                 if it is None:
                     tiles.append(np.zeros((H, W, 3), np.uint8))
                     continue
                 rngs = ranges[c.serial]
-                if state["mask"]:
-                    r = rngs.get(sel_name)
-                    m = make_mask(it["hsv"], r) if r else np.zeros((H, W), np.uint8)
-                    img = cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)
-                else:
-                    img = it["color"].copy()
+                img = np.zeros((H, W, 3), np.uint8) if state["mask"] else it["color"].copy()
                 found_txt = []
                 for name, count in markers:
                     r = rngs.get(name)
                     if not r:
                         found_txt.append((name, "--", (120, 120, 120)))
                         continue
-                    dets, dmask = detect(c, it, r, count + 2)   # 개수보다 많이 잡히는지도 보이게 +2
-                    nb, _, bst, _ = cv2.connectedComponentsWithStats(dmask)
-                    n_all = int((bst[1:, cv2.CC_STAT_AREA] >= MIN_AREA).sum())   # 이 색으로 잡히는 덩어리 전체 개수
+                    all_d, dmask, lab = analyses[ci][name]
+                    n_all = len(all_d)                         # 거리 안에서 이 색으로 잡히는 덩어리 전체 개수
+                    dets = all_d[:count + 2]                   # 개수보다 많이 잡히는지도 보이게 +2
+                    if state["mask"] and name == sel_name:
+                        img[dmask > 0] = (70, 70, 70)          # 색은 맞지만 버려진 것 (멀거나 depth 없음/너무 작음)
+                        if all_d:
+                            keep = np.zeros(int(lab.max()) + 1, bool)
+                            keep[[d["lab"] for d in all_d]] = True
+                            img[keep[lab]] = (255, 255, 255)
                     col = range_bgr(r)
                     is_sel = name == sel_name
                     for k, d in enumerate(dets):
@@ -260,6 +307,16 @@ def main():
                 cv2.rectangle(img, (0, 0), (W, 22), (0, 0, 0), -1)
                 put(img, f"{c.label}  {c.fps_val:4.1f}fps  {'MASK: ' + sel_name if state['mask'] else ''}",
                     (6, 16), 0.5)
+                cst = cam_st[c.serial]
+                if c.locking:
+                    st_txt, st_col = "LOCKING... keep hand in view", (0, 200, 255)
+                elif not cst["auto"]:
+                    st_txt, st_col = (f"LOCK e{cst['exposure']:.0f} g{cst['gain']:.0f} "
+                                      f"wb{cst['white_balance']:.0f}"), (80, 220, 80)
+                else:
+                    st_txt, st_col = "AUTO exposure (L to lock)", (0, 140, 255)
+                put(img, st_txt + f"  V{it['hsv'][::8, ::8, 2].mean():.0f}  gate {gates[sel_name]:.0f}",
+                    (6, 40), 0.45, st_col)
                 if state["frozen"]:
                     put(img, "FROZEN (SPACE)", (W - 170, 16), 0.5, (0, 200, 255), 1)
                 y = H - 10 - 20 * len(found_txt)
@@ -288,12 +345,28 @@ def main():
                 put(bar, state["msg"], (8, 52), 0.5, state["msg_col"])
             else:
                 help_t = ("SPACE freeze | click marker (yellow = will sample) | [ ] count | U undo | "
-                          "R reset | M mask | S save | Q quit")
+                          "R reset | M mask | L lock | ,. exp | -= gate | F full | S save | Q quit")
                 put(bar, help_t, (8, 52), 0.45, (170, 170, 170))
             if state["dirty"]:
                 put(bar, "* unsaved", (total_w - 110, 52), 0.5, (0, 200, 255))
             ui = np.vstack([bar, np.hstack(tiles)])
-            cv2.imshow(win, ui)
+            uh, uw = ui.shape[:2]
+            try:
+                _, _, ww, wh = cv2.getWindowImageRect(win)
+            except cv2.error:
+                ww, wh = uw, uh
+            if ww > 0 and wh > 0 and (ww, wh) != (uw, uh):
+                sc = min(ww / uw, wh / uh)
+                nw, nh = max(1, int(uw * sc)), max(1, int(uh * sc))
+                ox, oy = (ww - nw) // 2, (wh - nh) // 2
+                canvas = np.zeros((wh, ww, 3), np.uint8)
+                canvas[oy:oy + nh, ox:ox + nw] = cv2.resize(
+                    ui, (nw, nh), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR)
+                view[:] = [sc, ox, oy]
+                cv2.imshow(win, canvas)
+            else:
+                view[:] = [1.0, 0, 0]
+                cv2.imshow(win, ui)
 
             k = cv2.waitKey(1) & 0xFF
             if k == 255:
@@ -312,6 +385,46 @@ def main():
                 state["dirty"] = True
             elif ch == "m":
                 state["mask"] = not state["mask"]
+            elif ch == "l":
+                tgt = target_cams()
+                if any(c.locking for c in tgt):
+                    continue
+                if all(not cam_st[c.serial]["auto"] for c in tgt):
+                    for c in tgt:
+                        c.set_auto()
+                        cam_st[c.serial] = c.color_settings()
+                    state["dirty"] = True
+                    say("AUTO exposure", "자동 노출/화이트밸런스로 되돌림", (0, 140, 255))
+                else:
+                    if any(samples[c.serial][n] for c in tgt for n, _ in markers):
+                        say("Locked after sampling - consider R + re-click",
+                            "샘플을 찍은 뒤에 고정함 -> 색이 달라졌을 수 있으니 R 로 지우고 다시 클릭 권장", (0, 140, 255))
+                    else:
+                        say("Locking... keep the hand in view (~5s)",
+                            "고정 중... 손을 화면 안에 두고 몇 초 기다리세요", (0, 200, 255))
+                    for c in tgt:
+                        if cam_st[c.serial]["auto"]:
+                            c.lock_color(on_locked)
+            elif ch in (",", "."):
+                for c in target_cams():
+                    st = cam_st[c.serial]
+                    if st["auto"] or c.locking:
+                        continue
+                    c.set_manual(exposure=max(1.0, st["exposure"] * (0.8 if ch == "," else 1.25)))
+                    cam_st[c.serial] = c.color_settings()
+                    state["dirty"] = True
+                    e_max = 10000.0 / args.fps
+                    if cam_st[c.serial]["exposure"] > e_max:
+                        say(f"exposure > {e_max:.0f}: fps will drop",
+                            f"노출이 {e_max:.0f} 보다 길면 fps 가 떨어짐", (0, 140, 255))
+            elif ch in ("-", "="):
+                gates[sel_name] = float(np.clip(gates[sel_name] * (0.75 if ch == "-" else 1.33), 2, 400))
+                state["dirty"] = True
+                say(f"{sel_name} gate {gates[sel_name]:.1f}")
+            elif ch == "f":
+                full = cv2.getWindowProperty(win, cv2.WND_PROP_FULLSCREEN) == cv2.WINDOW_FULLSCREEN
+                cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN,
+                                      cv2.WINDOW_NORMAL if full else cv2.WINDOW_FULLSCREEN)
             elif ch == " ":
                 state["frozen"] = not state["frozen"]
                 say("FROZEN - click markers calmly" if state["frozen"] else "LIVE",
@@ -338,13 +451,15 @@ def main():
                     for name, count in markers:
                         r = ranges[c.serial].get(name)
                         if r:
-                            data[name] = dict(r, count=int(count))
+                            data[name] = dict(r, count=int(count), gate=round(gates[name], 1))
                         else:
                             data.pop(name, None)
                     p = save_hsv(c.serial, data, args.hsv_dir)
                     miss = [n for n, _ in markers if not ranges[c.serial].get(n)]
                     print(f"저장: {p}" + (f"   (미등록: {', '.join(miss)})" if miss else ""))
                     old[c.serial] = data
+                    cp = c.save_settings()
+                    print(f"저장: {cp}  ({'AUTO' if cam_st[c.serial]['auto'] else 'LOCK'})")
                 state["dirty"] = False
             elif ch == "q" or k == 27:
                 if state["dirty"] and not state["quit_armed"]:
@@ -357,6 +472,7 @@ def main():
             if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
                 break
     finally:
+        pool.shutdown(wait=False)
         for c in cams:
             c.stop()
         cv2.destroyAllWindows()
