@@ -299,9 +299,10 @@ def main():
                     cv2.drawMarker(zoom, zc, (255, 255, 255), cv2.MARKER_CROSS, 30, 1)
                     cv2.circle(zoom, zc, SNAP_R * ZOOM_K, (200, 200, 200), 1)       # 붙잡기 반경
                     zh, zw = zoom.shape[:2]
-                    # 마우스와 대각선 반대쪽 모서리에 놓아서 마커를 가리지 않게
+                    # 마우스 반대쪽, 항상 위쪽: 왼쪽 아래 'index 3/3' 목록과
+                    # 위쪽 상태 줄(y=40, 노출 LOCK/AUTO)을 가리지 않게 그 아래(y=50)부터
                     px0 = 8 if mo[1] > W // 2 else W - zw - 8
-                    py0 = 30 if mo[2] > H // 2 else H - zh - 8
+                    py0 = 50
                     img[py0:py0 + zh, px0:px0 + zw] = zoom
                     cv2.rectangle(img, (px0 - 1, py0 - 1), (px0 + zw, py0 + zh), (255, 255, 255), 1)
                 cv2.rectangle(img, (0, 0), (W, 22), (0, 0, 0), -1)
