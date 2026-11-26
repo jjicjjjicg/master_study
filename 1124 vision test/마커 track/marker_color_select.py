@@ -307,7 +307,7 @@ def main():
     cams = []
     for s in (args.serial or [sv for _, sv in devs]):
         try:
-            cams.append(RSCamera(s, W, H, args.fps))
+            cams.append(RSCamera(s, W, H, args.fps, depth=False))   # 색만 봄 → depth 정렬 안 함 (빠름)
             print("열림:", cams[-1].label)
         except Exception as e:
             print(f"열기 실패 {s}: {e}")

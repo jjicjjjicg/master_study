@@ -86,20 +86,36 @@ class RSCamera:
     """settings_dir 에 cam_<serial>.json 이 있고 auto=false 면 그 노출/게인/화이트밸런스로 고정해서 연다.
     (HSV 튜닝 때와 같은 색으로 보여야 하므로 트래킹 코드도 같은 파일을 자동으로 읽는다)"""
 
-    def __init__(self, serial, W=640, H=480, fps=30, processor=None, settings_dir=HERE):
+    def __init__(self, serial, W=640, H=480, fps=30, processor=None, settings_dir=HERE, depth=True):
+        """depth=True : depth 를 color 에 정렬 (rs.align). item["depth"] 가 color 와 같은 픽셀. 느림.
+        depth="raw": depth 를 정렬하지 않음. 마커 몇 개의 3D 는 xyz_at(u, v, item["depth"]) 로 그 점만 계산. 빠름.
+        depth=False: depth 안 받음 (item["depth"] = None). 색만 보는 도구용.
+        rs.align 은 무겁고 그동안 파이썬 GIL 을 잡고 있어서, 카메라 3대면 화면 처리가 몇 배 느려진다."""
         self.serial, self.W, self.H, self.fps = serial, W, H, fps
+        self.use_depth = bool(depth)
         self.pipe = rs.pipeline()
         cfg = rs.config()
         cfg.enable_device(serial)
         cfg.enable_stream(rs.stream.color, W, H, rs.format.bgr8, fps)
-        cfg.enable_stream(rs.stream.depth, W, H, rs.format.z16, fps)
+        if depth:
+            cfg.enable_stream(rs.stream.depth, W, H, rs.format.z16, fps)
         prof = self.pipe.start(cfg)
         dev = prof.get_device()
         self.model = dev.get_info(rs.camera_info.name).replace("Intel RealSense ", "")
         self.depth_scale = dev.first_depth_sensor().get_depth_scale()
         # depth 를 color 에 정렬하므로 3D 복원은 color intrinsics 로 한다
         self.intr = prof.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-        self.align = rs.align(rs.stream.color)
+        self.align = rs.align(rs.stream.color) if depth is True else None
+        if depth == "raw":                      # 점 단위 color->depth 대응용 보정값
+            ds = prof.get_stream(rs.stream.depth).as_video_stream_profile()
+            cs_ = prof.get_stream(rs.stream.color)
+            self.dintr = ds.get_intrinsics()
+            e = cs_.get_extrinsics_to(ds)       # color -> depth
+            self._R_cd = np.array(e.rotation, float).reshape(3, 3).T     # rs 는 column-major
+            self._t_cd = np.array(e.translation, float)
+            e = ds.get_extrinsics_to(cs_)       # depth -> color
+            self._R_dc = np.array(e.rotation, float).reshape(3, 3).T
+            self._t_dc = np.array(e.translation, float)
         self.processor = processor
         self.color_sensor = dev.first_color_sensor()
         self.settings_file = cam_path(serial, settings_dir) if settings_dir else None
@@ -137,15 +153,18 @@ class RSCamera:
         t0, n = time.time(), 0
         while self.running:
             try:
-                fs = self.align.process(self.pipe.wait_for_frames(3000))
+                fs = self.pipe.wait_for_frames(3000)
+                if self.align is not None:
+                    fs = self.align.process(fs)
             except Exception as e:
                 self.error = str(e)
                 continue
-            cf, df = fs.get_color_frame(), fs.get_depth_frame()
-            if not cf or not df:
+            cf = fs.get_color_frame()
+            df = fs.get_depth_frame() if self.use_depth else None
+            if not cf or (self.use_depth and not df):
                 continue
             color = np.asanyarray(cf.get_data()).copy()
-            depth = np.asanyarray(df.get_data()).copy()          # uint16 raw
+            depth = np.asanyarray(df.get_data()).copy() if df else None   # uint16 raw
             hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
             item = dict(color=color, depth=depth, hsv=hsv, ts_ms=cf.get_timestamp(),
                         frame_no=cf.get_frame_number(), t=time.time(), result=None)
@@ -313,6 +332,34 @@ class RSCamera:
                 done(self, ok, msg)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def xyz_at(self, u, v, depth, zmin=150.0, zmax=2000.0, win=2, tol=15.0):
+        """depth="raw" 모드에서 color 픽셀 (u, v) 의 3D 점 (mm, color 카메라 좌표). 없으면 None.
+        color 광선 위 거리 Z 를 촘촘히 바꿔가며 depth 영상의 해당 픽셀을 읽고, 읽은 depth 가 그 Z 와 맞는 곳을 찾음
+        (librealsense rs2_project_color_pixel_to_depth_pixel 과 같은 원리. 전체 정렬 대신 점 하나만 → 아주 빠름).
+        그 depth 픽셀 주변 (2*win+1)^2 에서 그 값과 tol(mm) 이내인 것들의 중앙값으로 잡음 제거."""
+        ray = np.array(rs.rs2_deproject_pixel_to_point(self.intr, [float(u), float(v)], 1.0))
+        Z = 1.0 / np.linspace(1.0 / (zmin / 1000.0), 1.0 / (zmax / 1000.0), 240)   # 1/Z 등간격 = depth 픽셀 등간격
+        P = (ray[None, :] * Z[:, None]) @ self._R_cd.T + self._t_cd                # depth 카메라 좌표 (m)
+        di = self.dintr
+        ud = np.round(di.fx * P[:, 0] / P[:, 2] + di.ppx).astype(int)
+        vd = np.round(di.fy * P[:, 1] / P[:, 2] + di.ppy).astype(int)
+        Hd, Wd = depth.shape
+        ok = (ud >= 0) & (ud < Wd) & (vd >= 0) & (vd < Hd)
+        if not ok.any():
+            return None
+        D = np.zeros(len(Z))
+        D[ok] = depth[vd[ok], ud[ok]] * self.depth_scale
+        err = np.where(ok & (D > 0), np.abs(D - P[:, 2]), np.inf)
+        j = int(np.argmin(err))
+        if not np.isfinite(err[j]) or err[j] * 1000.0 > max(tol, 0.03 * D[j] * 1000.0):
+            return None
+        x0, y0 = ud[j], vd[j]
+        patch = depth[max(0, y0 - win):y0 + win + 1, max(0, x0 - win):x0 + win + 1].astype(float) * self.depth_scale
+        near = patch[(patch > 0) & (np.abs(patch - D[j]) * 1000.0 <= tol)]
+        zd = float(np.median(near)) if near.size else float(D[j])
+        pd = np.array(rs.rs2_deproject_pixel_to_point(di, [float(x0), float(y0)], zd))
+        return (self._R_dc @ pd + self._t_dc) * 1000.0
 
     def deproject(self, u, v, z_mm):
         p = rs.rs2_deproject_pixel_to_point(self.intr, [float(u), float(v)], z_mm / 1000.0)

@@ -54,39 +54,49 @@ FLOOD_DIFF = (8, 70, 80)       # 시작 픽셀 기준 H/S/V 허용 차이 (flood
 CROP_R = 60                    # 클릭 주변 이 반경 안에서만 영역을 찾음 (마커보다 충분히 크게)
 SNAP_R = 15                    # 클릭이 마커에서 이만큼(px) 빗나가도 가장 가까운 마커로 붙여줌
 SNAP_MIN_S, SNAP_MIN_V = 60, 50  # '색이 있는' 픽셀 기준 (마커 후보)
+SNAP_CLICK_V = 20              # 클릭한 픽셀 자체는 이보다 밝으면 색으로 인정 (어두운 보라/파랑 마커)
+SEED_R, SEED_HUE = 3, 6         # 클릭 주변 3px 안, 색상 ±6 (OpenCV H, = ±12°) 인 픽셀만 시작점 후보
 ZOOM_R, ZOOM_K = 20, 6         # 돋보기: 마우스 주변 ±20px 을 6배 확대
 
 
 def snap_region(hsv, x, y):
-    """클릭(또는 마우스) 위치 근처의 마커 영역을 찾는다.
-    1) 클릭 주변 SNAP_R 안에 있는 '색 있는 덩어리' 중 가장 가까운 것을 고르고
-    2) 그 덩어리에서 채도가 가장 높은 픽셀(=마커 중심 쪽)에서 flood fill
-    → 손이 떨려 마커 가장자리나 살짝 옆을 찍어도 마커 중심색으로 샘플링된다.
+    """클릭(또는 마우스) 위치의 마커 영역을 찾는다. '클릭한 픽셀의 색'이 기준.
+    1) 클릭한 픽셀에 색이 있으면(채도 SNAP_MIN_S 이상, 어두운 마커도 되게 밝기 SNAP_CLICK_V 이상):
+       클릭 주변 SEED_R px 안에서 '클릭한 색과 같은 색상(±SEED_HUE)' 인 픽셀 중 채도가 가장 높은 곳에서 flood fill
+       (옆에 더 진한 다른 색 마커가 붙어 있어도 그쪽으로 넘어가지 않음)
+    2) 클릭한 곳이 회색(배경, 반사광)이면: SNAP_R 안에서 '가장 가까운' 색 픽셀로 붙여서 1) 과 같이
+       (손이 떨려 마커 살짝 옆을 찍어도 됨)
+    3) 그래도 안 되면 클릭 지점 그대로 (연한 색 마커용)
     반환: (region bool 배열 (crop 크기), (x0, y0) crop 시작점) 또는 (None, ...)"""
     Hh, Ww = hsv.shape[:2]
-    x, y = int(x), int(y)
+    x, y = int(np.clip(x, 0, Ww - 1)), int(np.clip(y, 0, Hh - 1))
     x0, y0 = max(0, x - CROP_R), max(0, y - CROP_R)
     x1, y1 = min(Ww, x + CROP_R + 1), min(Hh, y + CROP_R + 1)
     crop = np.ascontiguousarray(hsv[y0:y1, x0:x1])
     ch, cw = crop.shape[:2]
     cx, cy = x - x0, y - y0
+    Hc, Sc, Vc = (crop[..., i].astype(int) for i in range(3))
 
-    colored = ((crop[..., 1] >= SNAP_MIN_S) & (crop[..., 2] >= SNAP_MIN_V)).astype(np.uint8)
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(colored, connectivity=4)
-    yy, xx = np.mgrid[0:ch, 0:cw]
-    dist = np.hypot(xx - cx, yy - cy)
-    cands = []
-    for i in range(1, n):
-        if stats[i, cv2.CC_STAT_AREA] < 6:      # 노이즈 점(몇 픽셀)은 마커 후보에서 제외
-            continue
-        sel = lab == i
-        dmin = float(dist[sel].min())
-        if dmin <= SNAP_R:
-            s = np.where(sel, crop[..., 1].astype(int), -1)
-            sy, sx = np.unravel_index(np.argmax(s), s.shape)
-            cands.append((dmin, int(sx), int(sy)))
-    cands.sort()
-    seeds = [(sx, sy) for _, sx, sy in cands[:4]] + [(cx, cy)]   # 마지막: 클릭 지점 그대로 (연한 색 마커용)
+    def same_hue_best(px, py):
+        """(px,py) 주변 SEED_R 안에서 (px,py) 와 같은 색상이면서 채도가 가장 높은 픽셀."""
+        ya, yb, xa, xb = max(0, py - SEED_R), min(ch, py + SEED_R + 1), max(0, px - SEED_R), min(cw, px + SEED_R + 1)
+        dh = np.abs(Hc[ya:yb, xa:xb] - Hc[py, px])
+        dh = np.minimum(dh, 180 - dh)
+        score = np.where((dh <= SEED_HUE) & (Vc[ya:yb, xa:xb] >= SNAP_CLICK_V), Sc[ya:yb, xa:xb], -1)
+        sy, sx = np.unravel_index(np.argmax(score), score.shape)
+        return xa + int(sx), ya + int(sy)
+
+    seeds = []
+    if Sc[cy, cx] >= SNAP_MIN_S and Vc[cy, cx] >= SNAP_CLICK_V:
+        seeds.append(same_hue_best(cx, cy))
+    else:
+        colored = (Sc >= SNAP_MIN_S) & (Vc >= SNAP_MIN_V)
+        yy, xx = np.mgrid[0:ch, 0:cw]
+        dist = np.where(colored, np.hypot(xx - cx, yy - cy), np.inf)
+        ny, nx = np.unravel_index(np.argmin(dist), dist.shape)
+        if dist[ny, nx] <= SNAP_R:
+            seeds.append(same_hue_best(int(nx), int(ny)))
+    seeds.append((cx, cy))
 
     flags = 4 | cv2.FLOODFILL_FIXED_RANGE | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
     for sx, sy in seeds:
